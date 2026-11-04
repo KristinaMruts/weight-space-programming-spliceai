@@ -1,0 +1,6 @@
+raw/
+weights/
+rebuilt/
+__pycache__/
+*.pyc
+.DS_Store

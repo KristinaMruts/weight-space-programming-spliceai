@@ -1,0 +1,27 @@
+{
+  "weights": "model/model_10000nt_rs10.pt",
+  "variants": {
+    "n": 1734,
+    "n_pathogenic": 578,
+    "AUPRC": 0.9673,
+    "AUROC": 0.9767,
+    "exon_AUPRC": 0.8714,
+    "exon_AUROC": 0.9481,
+    "exon_n": 597,
+    "intron_AUPRC": 0.9804,
+    "intron_AUROC": 0.981,
+    "intron_n": 1137,
+    "sens@0.2": 0.8374,
+    "spec@0.2": 0.9827
+  },
+  "guard": {
+    "top_k_acceptors": 0.9545,
+    "auprc_acceptors": 0.9869,
+    "top_k_donors": 0.9407,
+    "auprc_donors": 0.9831,
+    "top_k_mean": 0.9476,
+    "genes": 60
+  },
+  "seconds": 1704.4,
+  "note": "full dev + guard, CPU batch 16"
+}

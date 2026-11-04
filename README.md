@@ -1,0 +1,161 @@
+# Weight-space programming on a clinical splicing model
+
+Can a language model improve a **useful, published** neural network by reading its weights and editing
+them by hand — no gradient descent, no automated search — and does the gain survive on data it never saw?
+
+This repository is a small, fully reproducible test of that idea (inspired by the
+[MIT CSAIL weight-space programming post](https://rikiyat.github.io/blog/weight-space-programming/)) on
+**OpenSpliceAI-MANE-10000nt**, an open re-implementation of SpliceAI, the splicing model used in clinical
+variant interpretation. The task is the one labs argue about: telling pathogenic from benign ClinVar variants
+near exon boundaries.
+
+## Result in one table
+
+Hidden test: ClinVar on chr1, chr11, chr16 — 1,842 variants, 614 pathogenic. Guard: top-k splice-site
+accuracy on 150 whole genes from chr1, a chromosome OpenSpliceAI was not trained on.
+
+| Model (test set) | changed params | AUPRC | AUROC | exon-side AUPRC | sens @0.2 | spec @0.2 | guard top-k |
+|---|---|---|---|---|---|---|---|
+| Distance to boundary only (no model) | — | 0.743 | 0.834 | — | — | — | — |
+| Original, seed 10 | 0 | 0.9385 | 0.9556 | 0.8215 | 0.761 | 0.976 | 0.9224 |
+| Original, 5-seed ensemble | — | 0.9532 | 0.9669 | 0.8487 | 0.811 | 0.985 | **0.9366** |
+| Temperature only (control, `final_conv` × 0.35) | 99 | 0.9695 | 0.9780 | 0.9024 | 0.787 | 0.994 | 0.9220 |
+| **Opus 5.5 edit** (hand edit, 2 changes) | 165 | **0.9746** | **0.9815** | **0.9142** | **0.816** | 0.993 | **0.9264** |
+| Gradient, `final_conv` only (G1) | 99 | 0.9697 | 0.9788 | 0.8865 | 0.873 | 0.978 | 0.9165 |
+| Gradient, all read-out layers (G2) | 5,379 | 0.9710 | 0.9797 | 0.8942 | 0.876 | 0.980 | 0.9197 |
+| Second LLM participant | — | pending | | | | | |
+
+Paired bootstrap on the test variants (2,000 resamples, `scripts/bootstrap.py`):
+
+| Comparison | ΔAUPRC, 95% CI | ΔAUROC, 95% CI |
+|---|---|---|
+| Opus edit − original | +0.036 [+0.028, +0.044] | +0.026 [+0.020, +0.032] |
+| Temperature only − original | +0.031 [+0.024, +0.038] | +0.022 [+0.016, +0.028] |
+| Opus edit − temperature only | +0.005 [+0.003, +0.007] | +0.004 [+0.002, +0.005] |
+| 5-seed ensemble − original | +0.015 [+0.010, +0.020] | +0.011 [+0.007, +0.016] |
+| Opus edit − 5-seed ensemble | +0.021 [+0.016, +0.028] | +0.015 [+0.009, +0.020] |
+| Gradient G1 − original | +0.031 [+0.023, +0.040] | +0.023 [+0.017, +0.030] |
+| Gradient G2 − original | +0.032 [+0.025, +0.041] | +0.024 [+0.018, +0.031] |
+| Opus edit − gradient G1 | +0.005 [+0.001, +0.009] | +0.003 [−0.001, +0.006] |
+| Opus edit − gradient G2 | +0.004 [−0.000, +0.007] | +0.002 [−0.002, +0.005] |
+| Gradient G1 − temperature only | +0.000 [−0.005, +0.005] | +0.001 [−0.003, +0.005] |
+
+## What the edit was
+
+Opus read the network and found that the class read-out is almost one-dimensional: skip channels 28 and 29
+carry the acceptor and donor evidence, and real splice sites sit about +5 logits above "neither"
+(p ≈ 0.995). The variant delta score is a *difference of probabilities*, so a pathogenic variant that removes
+2–4 logits from such a site barely moves it — the softmax is saturated. Two edits
+([`submissions/opus/edit.py`](submissions/opus/edit.py), reasoning in
+[`REPORT.md`](submissions/opus/REPORT.md)):
+
+1. **E1** — double the local-motif evidence (skip convolution after residual group 1, ±40 nt context) on
+   channels 28/29: 66 parameters.
+2. **E2** — scale `final_conv` by 0.35, i.e. raise the softmax temperature: 99 parameters.
+
+About 86 % of the gain comes from E2. E1 adds a small but significant +0.005 AUPRC, +3 pp sensitivity at the
+clinical 0.2 threshold and +0.4 pp guard accuracy.
+
+## How to read it
+
+- **The approach worked on a useful model and the gain transferred to unseen chromosomes** — 0.024 % of the
+  weights, exon-side AUPRC 0.82 → 0.91, specificity up as well.
+- **The valuable part is the diagnosis, not the surgery.** The fix itself is a classical knob (temperature).
+  Nobody tunes it for variant ranking, because SpliceAI-type models are used as shipped; reading the weights
+  is what pointed at it.
+- **No new skill was taught.** As in the MIT work, the edit removes an obstacle; variants the network cannot
+  read (e.g. exonic regulatory elements) stay missed.
+- **The probability scale moved** (a strong site is ≈ 0.88 instead of 0.99). The clinical SpliceAI cut-offs
+  0.2 / 0.5 / 0.8 must be recalibrated before any practical use of an edited model.
+- **Labels are partly circular**: some ClinVar classifications used SpliceAI. This affects the benchmark as a
+  whole, not one edit in particular.
+- **Gradient comparison.** Gradient fine-tuning of the same read-out layers on the same dev labels lands in the same
+  place: G1 (99 parameters) is indistinguishable from the temperature-only control, G2 (5,379 parameters) is
+  slightly better, and the Opus edit is level with G2 (+0.004 AUPRC, CI touching zero) and slightly better
+  than G1, keeps the largest exon-side gain (0.914 vs 0.894 and 0.887), and is the only one that does not lose guard accuracy (G1 −0.6 pp, G2 −0.3 pp, Opus +0.4 pp).
+  Gradient models also shift the operating point (sensitivity at 0.2 up to 0.87, specificity down to 0.98).
+  So reading the weights did not beat ordinary training here; it matched it with 165 explained changes, and it
+  produced the diagnosis that tells you *where* to train. All three beat the 5-seed ensemble, which is the
+  usual way to get more accuracy out of SpliceAI-type models; the ensemble keeps the best guard (0.937).
+
+## Setup
+
+| | |
+|---|---|
+| Model | OpenSpliceAI-MANE-10000nt, seed 10, 698,787 parameters, 10 kb context ([GPL-3.0](https://github.com/Kuanhao-Chao/OpenSpliceAI)) |
+| Variants | ClinVar GRCh38 release 2026-11-01; SNVs within 50 nt of an internal MANE Select exon boundary; intronic / synonymous / splice-region consequences (missense, nonsense and canonical ±1/±2 excluded); ≥ 1 review star; P/LP = 1 vs B/LB = 0, at most 2 benign per pathogenic |
+| Score | SpliceAI delta score DS_max = max(AG, AL, DG, DL) within ±50 nt |
+| Metric | AUPRC (primary), AUROC; exon vs intron side; sensitivity/specificity at 0.2 |
+| Guard | top-k splice-site accuracy on whole genes (as in the SpliceAI paper); allowed loss ≤ 1 pp |
+| Split | dev = chr17, 19, 21, 22 (1,734 variants, given to participants); test = chr1, 11, 16 (1,842 variants) |
+| Rules for participants | anything goes (code, forward passes, activations, literature) **except** gradient steps on the weights, automated weight search, other checkpoints and external variant labels; same architecture |
+
+The exact brief given to the LLMs is [`task/TASK.md`](task/TASK.md).
+
+**Blindness.** The Opus run (Claude Opus 5.5 in Claude Code, 4 Nov 2026, ~1 h 15 min, 7 candidates evaluated on
+dev) happened while the test set was hidden; its tool-call log was audited for access to the test files.
+This repository, including the test set, was published before the second participant submitted, so any later
+run is no longer blind. For new runs use a fresh split, e.g. ClinVar variants first submitted after this date.
+
+**Gradient controls** ([`scripts/gradient_baseline.py`](scripts/gradient_baseline.py)) answer "is this better
+than what one would normally do?". They are trained on the same dev labels, in the same read-out subspace the
+edit touched: G1 = `final_conv` only (contains temperature), G2 = all five skip convolutions + `final_conv`.
+Loss = pairwise AUC surrogate on DS_max + pairwise splice-site ranking loss on the dev guard (+ optional L2 to
+the original weights). Hyper-parameters were chosen on chr21+22 after training on chr17+19, with the dev guard
+allowed to drop ≤ 1 pp, then refit on all dev. The test set was used once per model.
+
+## Reproduce
+
+```bash
+python -m venv .venv && . .venv/bin/activate && pip install -r requirements.txt
+bash scripts/fetch_data.sh --weights-only           # OpenSpliceAI weights (5 seeds, 14 MB), checksums
+python scripts/check_data.py                        # shipped data/ matches the benchmark
+bash scripts/reproduce_edit.sh opus                 # edit.py -> bit-identical model_edited.pt
+cd scripts
+python score.py --weights ../weights/model_10000nt_rs10.pt --name original_rs10
+python score.py --weights ../submissions/opus/model_edited.pt --name opus
+python make_controls.py && python score.py --weights ../controls/temperature_only_035.pt --name control_temperature_only
+python score.py --ensemble ../weights --name ensemble_5_seeds
+python bootstrap.py original_rs10 opus
+```
+
+Scoring one model takes ~20–30 min on a laptop CPU (the ensemble ~5× that). Scoring is deterministic up to
+floating-point noise; the LLM runs themselves are not — a new run may find a different edit.
+
+To rebuild the data from raw sources (~0.5 GB download):
+
+```bash
+bash scripts/fetch_data.sh                            # GRCh38 chromosomes, GENCODE v46, ClinVar 2026-11-01
+python scripts/build_data.py --raw raw --out rebuilt
+python scripts/check_data.py rebuilt
+```
+
+To rerun the gradient controls: `python scripts/gradient_baseline.py feats ...` then `train ...` (see the
+docstring; feature caching ~25 min, training ~30 min on CPU).
+
+To run a new participant: give it `task/TASK.md`, `scripts/osai.py`, `scripts/evaluate.py`, `data/dev/`,
+`task/BASELINE_dev.json` and `weights/model_10000nt_rs10.pt` (not `data/test/`), then score its
+`model_edited.pt` with `score.py`.
+
+## Layout
+
+```
+task/          brief given to the LLM participants, dev baseline
+data/dev/      dev variants (+ 600-variant fast subset) and 60 guard genes
+data/test/     test variants and 150 guard genes (hidden during the Opus run)
+submissions/   per participant: edit.py, model_edited.pt, REPORT.md, dev_log.jsonl
+controls/      temperature-only and gradient-trained weights
+results/       scores.jsonl (all test metrics), ds_<name>.npy (per-variant delta scores)
+scripts/       model code, data build, scoring, bootstrap, gradient controls
+checksums/     SHA-256 of raw downloads, weights and data contents
+```
+
+## Licences and sources
+
+- Code: GPL-3.0 (the model code follows OpenSpliceAI, GPL-3.0). Edited weights in `submissions/` and
+  `controls/` are derivatives of OpenSpliceAI weights and are distributed under GPL-3.0 as well.
+- OpenSpliceAI: K.-H. Chao et al., [github.com/Kuanhao-Chao/OpenSpliceAI](https://github.com/Kuanhao-Chao/OpenSpliceAI).
+  SpliceAI: K. Jaganathan et al., *Cell* 2019. The original Illumina SpliceAI weights (CC BY-NC) are not used.
+- Variants: [ClinVar](https://www.ncbi.nlm.nih.gov/clinvar/) (NCBI). Annotation:
+  [GENCODE](https://www.gencodegenes.org/) v46. Genome: GRCh38 via the UCSC Genome Browser.
+- Nothing here is clinical advice; edited models are research artefacts and are not validated for diagnostics.
