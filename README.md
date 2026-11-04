@@ -5,9 +5,14 @@ them by hand — no gradient descent, no automated search — and does the gain 
 
 This repository is a small, fully reproducible test of that idea (inspired by the
 [MIT CSAIL weight-space programming post](https://rikiyat.github.io/blog/weight-space-programming/)) on
-**OpenSpliceAI-MANE-10000nt**, an open re-implementation of SpliceAI, the splicing model used in clinical
-variant interpretation. The task is the one labs argue about: telling pathogenic from benign ClinVar variants
-near exon boundaries.
+**OpenSpliceAI-MANE-10000nt**, an open re-training of SpliceAI, a model family whose delta scores inform
+clinical variant interpretation. The task: telling pathogenic from benign ClinVar variants near exon
+boundaries.
+
+**Short answer.** The LLM edit gave a real, transferable gain (AUPRC 0.939 → 0.975 on a hidden test), but
+≈ 86 % of it is a softmax temperature, and gradient fine-tuning of the same layers on the same labels gets
+practically the same result. The edit matched ordinary training rather than beating it; what it added was a
+diagnosis of *why* the score was losing signal. One model, one run, one editor.
 
 ## Result in one table
 
@@ -17,6 +22,8 @@ accuracy on 150 whole genes from chr1, a chromosome OpenSpliceAI was not trained
 | Model (test set) | changed params | AUPRC | AUROC | exon-side AUPRC | sens @0.2 | spec @0.2 | guard top-k |
 |---|---|---|---|---|---|---|---|
 | Distance to boundary only (no model) | — | 0.743 | 0.834 | — | — | — | — |
+| Per-position pathogenic rate, estimated on dev (no model) | — | 0.903 | 0.929 | — | — | — | — |
+| Original DS + per-position rate, logistic regression fit on dev | — | 0.9714 | 0.9793 | — | — | — | — |
 | Original, seed 10 | 0 | 0.9385 | 0.9556 | 0.8215 | 0.761 | 0.976 | 0.9224 |
 | Original, 5-seed ensemble | — | 0.9532 | 0.9669 | 0.8487 | 0.811 | 0.985 | **0.9366** |
 | Temperature only (control, `final_conv` × 0.35) | 99 | 0.9695 | 0.9780 | 0.9024 | 0.787 | 0.994 | 0.9220 |
@@ -24,6 +31,25 @@ accuracy on 150 whole genes from chr1, a chromosome OpenSpliceAI was not trained
 | Gradient, `final_conv` only (G1) | 99 | 0.9697 | 0.9788 | 0.8865 | 0.873 | 0.978 | 0.9165 |
 | Gradient, all read-out layers (G2) | 5,379 | 0.9710 | 0.9797 | 0.8942 | 0.876 | 0.980 | 0.9197 |
 | Second LLM participant | — | pending | | | | | |
+
+Sensitivity and specificity at a fixed 0.2 cut-off are shown for completeness only: the edited and
+gradient models have a different probability scale, so a fixed threshold compares different operating
+points. Fairer views (`scripts/extra_analyses.py`):
+
+| Model (test set) | AUPRC, chr1 only | AUPRC, ≥ 2-star records | sensitivity at the original's specificity (0.976) | sensitivity at DS ≥ 0.5 | sensitivity at DS ≥ 0.8 | pathogenic with DS ≤ 0.1 |
+|---|---|---|---|---|---|---|
+| Original, seed 10 | 0.9185 | 0.9698 | 0.761 | 0.642 | 0.490 | 111 |
+| 5-seed ensemble | 0.9333 | 0.9781 | 0.850 | 0.653 | 0.467 | 86 |
+| Temperature only | 0.9563 | 0.9877 | 0.873 | 0.484 | 0.083 | 65 |
+| Gradient G1 | 0.9531 | 0.9875 | 0.875 | 0.634 | 0.252 | 40 |
+| Gradient G2 | 0.9542 | 0.9886 | 0.894 | 0.655 | 0.298 | 38 |
+| **Opus edit** | **0.9595** | **0.9895** | **0.896** | 0.550 | 0.151 | 51 |
+
+chr1 is the only test chromosome that OpenSpliceAI itself held out (its test set is chr1, 3, 5, 7, 9);
+chr11, chr16 and all dev chromosomes were in its training data. 68.5 % of test records have one review star;
+the ≥ 2-star subset has 580 variants, 295 pathogenic. In ClinGen SVI guidance
+([Walker et al., 2023](https://pmc.ncbi.nlm.nih.gov/articles/PMC10357475/)) SpliceAI ≥ 0.2 supports PP3 and
+≤ 0.1 supports BP4; 0.5 and 0.8 are the cut-offs from the original SpliceAI paper.
 
 Paired bootstrap on the test variants (2,000 resamples, `scripts/bootstrap.py`):
 
@@ -40,6 +66,13 @@ Paired bootstrap on the test variants (2,000 resamples, `scripts/bootstrap.py`):
 | Opus edit − gradient G2 | +0.004 [−0.000, +0.007] | +0.002 [−0.002, +0.005] |
 | Gradient G1 − temperature only | +0.000 [−0.005, +0.005] | +0.001 [−0.003, +0.005] |
 
+The bootstrap treats the models as fixed and is not corrected for multiple comparisons. With a Bonferroni
+correction for 14 whole-test comparisons (99.64 % intervals), the Opus edit is **not** significantly better
+than either gradient control: vs G1 +0.005 [−0.001, +0.011], vs G2 +0.004 [−0.002, +0.009]; it stays
+better than the ensemble (+0.021 [+0.013, +0.032]) and than temperature only (+0.005 [+0.002, +0.008]).
+Other resampling schemes (`scripts/extra_analyses.py`): Opus − original, resampling whole genes,
++0.036 [+0.028, +0.046]; on chr1 alone +0.041 [+0.028, +0.056].
+
 ## What the edit was
 
 Opus read the network and found that the class read-out is almost one-dimensional: skip channels 28 and 29
@@ -53,30 +86,52 @@ carry the acceptor and donor evidence, and real splice sites sit about +5 logits
    channels 28/29: 66 parameters.
 2. **E2** — scale `final_conv` by 0.35, i.e. raise the softmax temperature: 99 parameters.
 
-About 86 % of the gain comes from E2. E1 adds a small but significant +0.005 AUPRC, +3 pp sensitivity at the
-clinical 0.2 threshold and +0.4 pp guard accuracy.
+E2 is exactly a softmax temperature: softmax(0.35·z) = softmax(z / T) with T ≈ 2.86. About 86 % of the
+gain comes from it. E1 adds +0.005 AUPRC [+0.003, +0.007] on the whole test, but this is mostly a
+reordering of variants *between* positions: within a position, AUROC is 0.957 for temperature only and
+0.958 for the Opus edit. On chr1 alone E1 is not significant (+0.003 [−0.000, +0.007]). E1 was never tested
+without E2. Practically all of the effect is the temperature.
 
 ## How to read it
 
-- **The approach worked on a useful model and the gain transferred to unseen chromosomes** — 0.024 % of the
-  weights, exon-side AUPRC 0.82 → 0.91, specificity up as well.
-- **The valuable part is the diagnosis, not the surgery.** The fix itself is a classical knob (temperature).
-  Nobody tunes it for variant ranking, because SpliceAI-type models are used as shipped; reading the weights
-  is what pointed at it.
+- **The approach worked on a useful model and the gain transferred** — 0.024 % of the weights changed,
+  AUPRC +0.036 on the hidden test, and the gain holds on chr1, which OpenSpliceAI never trained on.
+- **It matched ordinary training rather than beating it.** Gradient fine-tuning of the same read-out layers
+  on the same dev labels lands in the same place: G1 (99 parameters) is indistinguishable from the
+  temperature-only control, G2 (5,379 parameters) is within noise of the Opus edit, and after correction for
+  multiple comparisons neither gap is significant. A two-feature logistic regression (original DS plus the
+  per-position pathogenic rate) reaches 0.9714, also at the gradient level; on top of the Opus edit the same
+  regression reaches 0.9820, so the positional prior and the edit are partly complementary.
+- **The valuable part is the diagnosis, not the surgery.** The fix is a classical knob (temperature), and a
+  one-dimensional sweep of the multiplier on dev peaks at 0.30–0.35, exactly where Opus stopped (computed
+  from the dev logits cached during the Opus run; the cache is not shipped). What reading the weights gave is
+  the reason — strong sites are saturated in the softmax, so the delta score, a difference of probabilities,
+  compresses large logit losses — and where in the network that is fixed. "Softmax is saturated" is a
+  classical hypothesis an experienced engineer could also test. OpenSpliceAI ships a `calibrate` step
+  (per-class temperature scaling) aimed at site probabilities; whether it gives the same ranking effect was
+  not tested.
+- **The ensemble comparison is incomplete.** All three single-model fixes beat the untempered 5-seed
+  ensemble, which keeps the best guard (0.937). A tempered ensemble was not tested.
+- **The guard barely sees temperature.** Top-k within a class is nearly invariant to it, so the guard checks
+  E1 but not E2. Guard differences (Opus +0.4 pp, temperature only −0.04 pp, G1 −0.6 pp, G2 −0.3 pp) are
+  within noise on 150 genes. On variants that create new sites deeper in the intron (D+7 and beyond) the
+  edited models are worse than the original: test AUROC 0.868 → 0.837 (temperature only) and 0.863 (Opus).
+  Deep intronic variants (> 50 nt from a boundary) are not in the benchmark.
+- **The probability scale moved** (a strong site is ≈ 0.88 instead of 0.99). At DS ≥ 0.8 the Opus edit finds
+  15 % of pathogenic variants instead of 49 %. Any practical use would need re-calibrated thresholds and
+  re-validation.
+- **The main lever does not transfer to ordinary classifiers.** Temperature changes the ranking here only
+  because the score is a difference of two saturated probabilities. For a classifier that ranks by its own
+  probability, temperature is monotone and leaves AUROC / AUPRC unchanged.
 - **No new skill was taught.** As in the MIT work, the edit removes an obstacle; variants the network cannot
   read (e.g. exonic regulatory elements) stay missed.
-- **The probability scale moved** (a strong site is ≈ 0.88 instead of 0.99). The clinical SpliceAI cut-offs
-  0.2 / 0.5 / 0.8 must be recalibrated before any practical use of an edited model.
-- **Labels are partly circular**: some ClinVar classifications used SpliceAI. This affects the benchmark as a
-  whole, not one edit in particular.
-- **Gradient comparison.** Gradient fine-tuning of the same read-out layers on the same dev labels lands in the same
-  place: G1 (99 parameters) is indistinguishable from the temperature-only control, G2 (5,379 parameters) is
-  slightly better, and the Opus edit is level with G2 (+0.004 AUPRC, CI touching zero) and slightly better
-  than G1, keeps the largest exon-side gain (0.914 vs 0.894 and 0.887), and is the only one that does not lose guard accuracy (G1 −0.6 pp, G2 −0.3 pp, Opus +0.4 pp).
-  Gradient models also shift the operating point (sensitivity at 0.2 up to 0.87, specificity down to 0.98).
-  So reading the weights did not beat ordinary training here; it matched it with 165 explained changes, and it
-  produced the diagnosis that tells you *where* to train. All three beat the 5-seed ensemble, which is the
-  usual way to get more accuracy out of SpliceAI-type models; the ensemble keeps the best guard (0.937).
+- **Why the test gain (+0.036) is larger than the dev gain (+0.018).** The gain grows with the original
+  model's headroom per chromosome (dev: +0.011 on chr17 to +0.058 on chr21; test: +0.028 to +0.041). Dev is
+  dominated by NF1 (142 of 578 pathogenic variants), where the original is already near-perfect; without NF1
+  the dev gain is +0.023.
+- **Labels and sampling.** Some ClinVar classifications used SpliceAI, so labels are partly circular. Benign
+  variants are one random 2:1 subsample; other subsamples were not tested. The delta-score window is ±50 nt,
+  not the ±4,999 nt used by ClinGen.
 
 ## Setup
 
@@ -94,6 +149,10 @@ The exact brief given to the LLMs is [`task/TASK.md`](task/TASK.md).
 
 **Blindness.** The Opus run (Claude Opus 5.5 in Claude Code, 4 Nov 2026, ~1 h 15 min, 7 candidates evaluated on
 dev) happened while the test set was hidden; its tool-call log was audited for access to the test files.
+The audit was done on the log, not enforced by a sandbox: the test files were readable by the same OS
+user, internet access was allowed and web requests were not separately reviewed. The brief hints where the
+headroom is (exon side) and that a monotone recalibration cannot change the metrics. The brief, the
+controls and the scoring were prepared with Claude as well.
 This repository, including the test set, was published before the second participant submitted, so any later
 run is no longer blind. For new runs use a fresh split, e.g. ClinVar variants first submitted after this date.
 
@@ -117,7 +176,12 @@ python score.py --weights ../submissions/opus/model_edited.pt --name opus
 python make_controls.py && python score.py --weights ../controls/temperature_only_035.pt --name control_temperature_only
 python score.py --ensemble ../weights --name ensemble_5_seeds
 python bootstrap.py original_rs10 opus
+python extra_analyses.py                            # positional baselines, chr1, gene bootstrap, operating points
 ```
+
+`extra_analyses.py` needs only the shipped `results/` and `data/`. It also uses dev delta scores for the
+original, temperature-only and Opus models (`results/dev/`), which were computed during the Opus run from
+the same model code.
 
 Scoring one model takes ~20–30 min on a laptop CPU (the ensemble ~5× that). Scoring is deterministic up to
 floating-point noise; the LLM runs themselves are not — a new run may find a different edit.
@@ -145,8 +209,8 @@ data/dev/      dev variants (+ 600-variant fast subset) and 60 guard genes
 data/test/     test variants and 150 guard genes (hidden during the Opus run)
 submissions/   per participant: edit.py, model_edited.pt, REPORT.md, dev_log.jsonl
 controls/      temperature-only and gradient-trained weights
-results/       scores.jsonl (all test metrics), ds_<name>.npy (per-variant delta scores)
-scripts/       model code, data build, scoring, bootstrap, gradient controls
+results/       scores.jsonl (all test metrics), ds_<name>.npy (per-variant delta scores); dev/ — dev delta scores
+scripts/       model code, data build, scoring, bootstrap, gradient controls, extra analyses
 checksums/     SHA-256 of raw downloads, weights and data contents
 ```
 
