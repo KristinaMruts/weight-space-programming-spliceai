@@ -183,6 +183,20 @@ python extra_analyses.py                            # positional baselines, chr1
 original, temperature-only and Opus models (`results/dev/`), which were computed during the Opus run from
 the same model code.
 
+**Preprint numbers and figures.** Two more scripts reproduce everything else in the preprint:
+
+```bash
+python scripts/paper_analyses.py        # Table 2 with Bonferroni intervals, exon side, AUROC gain, BP4 shares (~1 min)
+python scripts/make_figures.py          # Figs. 1-3 into figures/ (needs matplotlib)
+python scripts/gradient_baseline.py feats --data data/dev --weights weights/model_10000nt_rs10.pt --cache cache
+python scripts/paper_analyses.py --feats cache/var_feats.npy   # + dev temperature sweep, G1 margin analysis
+python scripts/make_figures.py --feats cache/var_feats.npy     # + Fig. 4
+```
+
+The `feats` step runs the original model once over the dev windows (~20 min on CPU) and writes the inputs of
+the five skip convolutions; from them the read-out is linear, so the temperature sweep and the G1 analysis
+take seconds. The `figures/` folder holds the PDFs used in the preprint.
+
 Scoring one model takes ~20–30 min on a laptop CPU (the ensemble ~5× that). Scoring is deterministic up to
 floating-point noise; the LLM runs themselves are not — a new run may find a different edit.
 
@@ -210,7 +224,9 @@ data/test/     test variants and 150 guard genes (hidden during the Opus run)
 submissions/   per participant: edit.py, model_edited.pt, REPORT.md, dev_log.jsonl
 controls/      temperature-only and gradient-trained weights
 results/       scores.jsonl (all test metrics), ds_<name>.npy (per-variant delta scores); dev/ — dev delta scores
-scripts/       model code, data build, scoring, bootstrap, gradient controls, extra analyses
+scripts/       model code, data build, scoring, bootstrap, gradient controls, extra analyses,
+               preprint numbers (paper_analyses.py) and figures (make_figures.py)
+figures/       figures of the preprint
 checksums/     SHA-256 of raw downloads, weights and data contents
 ```
 
