@@ -12,7 +12,9 @@ boundaries.
 **Short answer.** The LLM edit gave a real, transferable gain (AUPRC 0.939 → 0.975 on a hidden test), but
 ≈ 86 % of it is a softmax temperature, and gradient fine-tuning of the same layers on the same labels gets
 practically the same result. The edit matched ordinary training rather than beating it; what it added was a
-diagnosis of *why* the score was losing signal. One model, one run, one editor.
+diagnosis of *why* the score was losing signal. One model, one run, one editor. The temperature effect itself
+is not specific to that model: it holds on all five OpenSpliceAI seeds, and a tempered 5-seed ensemble
+matches the edit without touching any weight ([below](#temperature-on-all-five-seeds-and-calibrate)).
 
 ## Result in one table
 
@@ -107,11 +109,12 @@ without E2. Practically all of the effect is the temperature.
   from the dev logits cached during the Opus run; the cache is not shipped). What reading the weights gave is
   the reason — strong sites are saturated in the softmax, so the delta score, a difference of probabilities,
   compresses large logit losses — and where in the network that is fixed. "Softmax is saturated" is a
-  classical hypothesis an experienced engineer could also test. OpenSpliceAI ships a `calibrate` step
-  (per-class temperature scaling) aimed at site probabilities; whether it gives the same ranking effect was
-  not tested.
-- **The ensemble comparison is incomplete.** All three single-model fixes beat the untempered 5-seed
-  ensemble, which keeps the best guard (0.937). A tempered ensemble was not tested.
+  classical hypothesis an experienced engineer could also test. OpenSpliceAI's own `calibrate` step does not
+  find it: fitted for site probabilities, it lands near T = 1 and leaves variant ranking as it was
+  ([below](#temperature-on-all-five-seeds-and-calibrate)).
+- **A tempered ensemble is as good as the edit.** All three single-model fixes beat the untempered 5-seed
+  ensemble, which keeps the best guard (0.937). With a temperature the ensemble reaches 0.9753–0.9765,
+  level with the Opus edit (difference −0.001 [−0.004, +0.002]).
 - **The guard barely sees temperature.** Top-k within a class is nearly invariant to it, so the guard checks
   E1 but not E2. Guard differences (Opus +0.4 pp, temperature only −0.04 pp, G1 −0.6 pp, G2 −0.3 pp) are
   within noise on 150 genes. On variants that create new sites deeper in the intron (D+7 and beyond) the
@@ -132,6 +135,49 @@ without E2. Practically all of the effect is the temperature.
 - **Labels and sampling.** Some ClinVar classifications used SpliceAI, so labels are partly circular. Benign
   variants are one random 2:1 subsample; other subsamples were not tested. The delta-score window is ±50 nt,
   not the ±4,999 nt used by ClinGen.
+
+## Temperature on all five seeds and `calibrate`
+
+Is the de-saturation a quirk of seed 10, and does OpenSpliceAI already offer it? `scripts/seeds_temperature.py`
+caches the final-layer logits of all five seeds once (dev and test variants, dev guard genes; no weight is
+changed) and then scores every variant with the logits divided by a temperature T before the softmax.
+T\* is picked per seed on dev AUPRC (grid 0.5–20) and applied to test once. Sensitivity is measured at the
+specificity the untempered model of the same seed has at DS = 0.2. Intervals: paired bootstrap over variants.
+
+| Seed (test) | T = 1 | T = 1/0.35 (the Opus E2 factor) | T\* from dev | gain at T\*, 95 % CI | sensitivity T = 1 → T\* |
+|---|---|---|---|---|---|
+| rs10 | 0.9385 | 0.9695 | 0.9701 (T\* = 3.0) | +0.032 [+0.024, +0.039] | 0.761 → 0.884 |
+| rs11 | 0.9413 | 0.9705 | 0.9708 (3.0) | +0.030 [+0.022, +0.037] | 0.769 → 0.868 |
+| rs12 | 0.9413 | 0.9698 | 0.9716 (3.25) | +0.030 [+0.023, +0.038] | 0.772 → 0.862 |
+| rs13 | 0.9454 | 0.9717 | 0.9731 (3.25) | +0.028 [+0.021, +0.035] | 0.779 → 0.858 |
+| rs14 | 0.9346 | 0.9650 | 0.9676 (3.5) | +0.033 [+0.025, +0.042] | 0.741 → 0.850 |
+
+| 5-seed ensemble (mean of softmax, as `openspliceai variant` does) | AUPRC | AUROC | sensitivity\* | gain vs T = 1, 95 % CI |
+|---|---|---|---|---|
+| T = 1 (current default) | 0.9532 | 0.9669 | 0.813 | — |
+| T = 1/0.35 for every seed | 0.9756 | 0.9829 | 0.866 | +0.022 [+0.017, +0.029] |
+| one common T\* from dev (2.75) | 0.9753 | 0.9827 | 0.866 | +0.022 [+0.016, +0.028] |
+| per-seed T\* from dev | 0.9765 | 0.9836 | 0.871 | +0.023 [+0.017, +0.030] |
+| per-seed temperatures from `calibrate` (re-implemented) | 0.9509 | 0.9654 | 0.805 | −0.002 [−0.004, −0.001] |
+| T → ∞ limit (pure logit score, max \|Δ(z_c − mean z)\|) | 0.9416 | 0.9622 | 0.702 | — |
+| reference: Opus edit, single model | 0.9746 | 0.9815 | 0.863 | — |
+
+\* at the specificity of the untempered ensemble at DS = 0.2.
+
+- **It is not one seed.** Every seed has its dev optimum at T ≈ 3–3.5 and gains +0.028…+0.033 on test.
+- **`calibrate` answers a different question.** `openspliceai calibrate` fits a per-class temperature vector by
+  NLL over all positions of held-out sequences (Adam, lr 0.01, clamp [0.05, 5];
+  `openspliceai/calibrate/temperature_scaling.py`). Re-implemented on the 60 dev guard genes it gives
+  T = 0.87–1.25 per class and seed, i.e. the site probabilities are already close to calibrated, and variant
+  AUPRC drops slightly. Honest site probabilities and good variant ranking need different temperatures. Note
+  also that `openspliceai variant` does not apply a calibration temperature at all. The re-implementation uses
+  our guard genes (GENCODE v46 basic), not OpenSpliceAI's own validation h5 files.
+- **There is an optimum.** Dropping the softmax altogether (T → ∞) is worse than the stock score.
+- **What it would take to use it.** A temperature changes the probability scale, so the ClinGen thresholds
+  (≥ 0.2 for PP3, ≤ 0.1 for BP4) would have to be re-calibrated; it could only be an extra scoring mode. The
+  evidence here is ClinVar labels only, part of which were informed by SpliceAI, and chr11/chr16 were in
+  OpenSpliceAI's training data; an independent check on experimentally measured splicing (minigene, MAVE,
+  RNA-seq) is missing.
 
 ## Setup
 
@@ -197,6 +243,16 @@ The `feats` step runs the original model once over the dev windows (~20 min on C
 the five skip convolutions; from them the read-out is linear, so the temperature sweep and the G1 analysis
 take seconds. The `figures/` folder holds the PDFs used in the preprint.
 
+**Temperature on five seeds and `calibrate`:**
+
+```bash
+for s in 10 11 12 13 14; do python scripts/seeds_temperature.py logits --seed $s --cache cache/seeds; done
+python scripts/seeds_temperature.py analyze --cache cache/seeds --out results/seeds_temperature.json
+```
+
+The `logits` step runs each seed once over dev and test variants and the dev guard genes (~40 min per seed on
+a laptop CPU; five in parallel took 1.5 h on 10 cores, 78 MB of cache); `analyze` takes seconds.
+
 Scoring one model takes ~20–30 min on a laptop CPU (the ensemble ~5× that). Scoring is deterministic up to
 floating-point noise; the LLM runs themselves are not — a new run may find a different edit.
 
@@ -223,7 +279,8 @@ data/dev/      dev variants (+ 600-variant fast subset) and 60 guard genes
 data/test/     test variants and 150 guard genes (hidden during the Opus run)
 submissions/   per participant: edit.py, model_edited.pt, REPORT.md, dev_log.jsonl
 controls/      temperature-only and gradient-trained weights
-results/       scores.jsonl (all test metrics), ds_<name>.npy (per-variant delta scores); dev/ — dev delta scores
+results/       scores.jsonl (all test metrics), ds_<name>.npy (per-variant delta scores); dev/ — dev delta scores;
+               seeds_temperature.json — temperature on five seeds, ensemble and calibrate
 scripts/       model code, data build, scoring, bootstrap, gradient controls, extra analyses,
                preprint numbers (paper_analyses.py) and figures (make_figures.py)
 figures/       figures of the preprint
