@@ -16,6 +16,8 @@ Scores (all from the same logits z, DS = max over the 101 positions of the four 
                    guard genes, Adam lr 0.01, clamp [0.05, 5], ReduceLROnPlateau, early stop), see
                    openspliceai/calibrate/temperature_scaling.py; note `openspliceai variant` does not apply it
   T -> inf limit   max over positions and the two site classes of |delta(z_c - mean_k z_k)| (pure logit score)
+  log-odds floor   class log-odds log p - log(1 - p) at T = 1, floored at -c (c chosen on dev), max |delta|
+                   over positions and the two site classes (suggested by a reader; without a floor it is worse)
 Ensemble = mean of the five softmax outputs (as in OpenSpliceAI / SpliceAI), each seed with its own T.
 """
 from __future__ import annotations
@@ -108,6 +110,25 @@ def ds_logit_limit(z):
     return np.abs(d[:, 1:]).max((1, 2))
 
 
+CLIPS = [None, 12, 10, 8, 6, 5, 4, 3]
+
+
+def ds_logodds(p, clip=None):
+    """Delta of the class log-odds log p_c - log(1 - p_c) for acceptor and donor, floored at -clip,
+    max |delta| over the 101 positions and both classes. p (N, 2, 3, L) probabilities."""
+    p = np.clip(p[:, :, 1:], 1e-12, 1 - 1e-12)
+    lo = np.log(p) - np.log1p(-p)
+    if clip is not None:
+        lo = np.maximum(lo, -clip)
+    return np.abs(lo[:, 1] - lo[:, 0]).reshape(len(p), -1).max(1)
+
+
+def pick_clip(ydev, pdev):
+    curve = {str(c): ev.auprc(ydev, ds_logodds(pdev, c)) for c in CLIPS}
+    best = max(CLIPS, key=lambda c: curve[str(c)])
+    return best, curve
+
+
 def calibrate_T(z, y, epochs=2000, patience=2):
     """Re-implementation of ModelWithTemperature.set_temperature (class-wise, NLL, Adam 0.01, clamp)."""
     zt = torch.from_numpy(z.astype(np.float32)); yt = torch.from_numpy(y.astype(np.int64))
@@ -180,7 +201,13 @@ def cmd_analyze(a):
             sc = ds_from_probs(softmax_T(Z[s]["test"], T))
             r["test"][lab] = metrics(ytest, sc, spec_ref) | {"guard_note": "scalar T keeps guard top-k" if np.size(T) == 1 else "class-wise"}
         r["test"]["logit_limit"] = metrics(ytest, ds_logit_limit(Z[s]["test"]), spec_ref)
+        r["test"]["log-odds, no floor"] = metrics(ytest, ds_logodds(softmax_T(Z[s]["test"], 1.0)), spec_ref)
+        clip, r["dev_AUPRC_logodds_floor"] = pick_clip(ydev, softmax_T(Z[s]["dev"], 1.0))
+        lo_test = ds_logodds(softmax_T(Z[s]["test"], 1.0), clip)
+        r["test"][f"log-odds, floor -{clip} (dev)"] = metrics(ytest, lo_test, spec_ref)
+        r["logodds_floor_dev"] = clip
         r["test"]["delta_T*_vs_T1"] = paired_boot(ytest, base, ds_from_probs(softmax_T(Z[s]["test"], T_star)))
+        r["test"]["delta_logodds_floor_vs_T*"] = paired_boot(ytest, ds_from_probs(softmax_T(Z[s]["test"], T_star)), lo_test)
         res["seeds"][f"rs{s}"] = r
         T_choice[s] = {"T=1": 1.0, "T=1/0.35": 1 / 0.35, "T*_dev": T_star, "calibrate": T_cal}
         print(f"rs{s}: T*={T_star} calibrate T={np.round(T_cal, 3)} test AUPRC "
@@ -203,6 +230,16 @@ def cmd_analyze(a):
         res["ensemble"]["test"][lab] = metrics(ytest, sc, spec_ref)
         if lab != "T=1":
             res["ensemble"]["test"][lab]["delta_vs_T1_boot"] = paired_boot(ytest, base, sc)
+    # floored log-odds on the ensemble's mean probabilities (T = 1), floor chosen on dev
+    clip_e, res["ensemble"]["dev_AUPRC_logodds_floor"] = pick_clip(ydev, ens("dev", lambda s: 1.0))
+    res["ensemble"]["logodds_floor_dev"] = clip_e
+    lo_e = ds_logodds(ens("test", lambda s: 1.0), clip_e)
+    t_e = ds_from_probs(ens("test", variants["common T*_dev"]))
+    res["ensemble"]["test"][f"log-odds, floor -{clip_e} (dev)"] = metrics(ytest, lo_e, spec_ref) | {
+        "delta_vs_T1_boot": paired_boot(ytest, base, lo_e),
+        "delta_vs_common_T*_boot": paired_boot(ytest, t_e, lo_e),
+        "opus_minus_this_boot": paired_boot(ytest, lo_e, np.load(ROOT / "results/ds_opus.npy").max(1))}
+    res["ensemble"]["test"]["log-odds, no floor"] = metrics(ytest, ds_logodds(ens("test", lambda s: 1.0)), spec_ref)
     lim = np.mean([ds_logit_limit(Z[s]["test"]) for s in SEEDS], 0)
     res["ensemble"]["test"]["logit_limit (mean over seeds)"] = metrics(ytest, lim, spec_ref)
     opus = np.load(ROOT / "results/ds_opus.npy").max(1)

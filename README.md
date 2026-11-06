@@ -13,8 +13,9 @@ boundaries.
 ≈ 86 % of it is a softmax temperature, and gradient fine-tuning of the same layers on the same labels gets
 practically the same result. The edit matched ordinary training rather than beating it; what it added was a
 diagnosis of *why* the score was losing signal. One model, one run, one editor. The temperature effect itself
-is not specific to that model: it holds on all five OpenSpliceAI seeds, and a tempered 5-seed ensemble
-matches the edit without touching any weight ([below](#temperature-on-all-five-seeds-and-calibrate)).
+is not specific to that model: it holds on all five OpenSpliceAI seeds, a tempered 5-seed ensemble matches
+the edit, and reading the stock ensemble's output as floored log-odds beats it (0.979), all without touching
+any weight ([below](#temperature-on-all-five-seeds-floored-log-odds-and-calibrate)).
 
 ## Result in one table
 
@@ -111,10 +112,11 @@ without E2. Practically all of the effect is the temperature.
   compresses large logit losses — and where in the network that is fixed. "Softmax is saturated" is a
   classical hypothesis an experienced engineer could also test. OpenSpliceAI's own `calibrate` step does not
   find it: fitted for site probabilities, it lands near T = 1 and leaves variant ranking as it was
-  ([below](#temperature-on-all-five-seeds-and-calibrate)).
+  ([below](#temperature-on-all-five-seeds-floored-log-odds-and-calibrate)).
 - **A tempered ensemble is as good as the edit.** All three single-model fixes beat the untempered 5-seed
   ensemble, which keeps the best guard (0.937). With a temperature the ensemble reaches 0.9753–0.9765,
-  level with the Opus edit (difference −0.001 [−0.004, +0.002]).
+  level with the Opus edit (difference −0.001 [−0.004, +0.002]). Reading its output as log-odds with a floor
+  reaches 0.9794, above the edit (+0.005 [+0.002, +0.008]).
 - **The guard barely sees temperature.** Top-k within a class is nearly invariant to it, so the guard checks
   E1 but not E2. Guard differences (Opus +0.4 pp, temperature only −0.04 pp, G1 −0.6 pp, G2 −0.3 pp) are
   within noise on 150 genes. On variants that create new sites deeper in the intron (D+7 and beyond) the
@@ -136,7 +138,7 @@ without E2. Practically all of the effect is the temperature.
   variants are one random 2:1 subsample; other subsamples were not tested. The delta-score window is ±50 nt,
   not the ±4,999 nt used by ClinGen.
 
-## Temperature on all five seeds and `calibrate`
+## Temperature on all five seeds, floored log-odds and `calibrate`
 
 Is the de-saturation a quirk of seed 10, and does OpenSpliceAI already offer it? `scripts/seeds_temperature.py`
 caches the final-layer logits of all five seeds once (dev and test variants, dev guard genes; no weight is
@@ -160,9 +162,33 @@ specificity the untempered model of the same seed has at DS = 0.2. Intervals: pa
 | per-seed T\* from dev | 0.9765 | 0.9836 | 0.871 | +0.023 [+0.017, +0.030] |
 | per-seed temperatures from `calibrate` (re-implemented) | 0.9509 | 0.9654 | 0.805 | −0.002 [−0.004, −0.001] |
 | T → ∞ limit (pure logit score, max \|Δ(z_c − mean z)\|) | 0.9416 | 0.9622 | 0.702 | — |
+| class log-odds, no floor | 0.9268 | 0.9566 | 0.607 | — |
+| **class log-odds, floor −4 chosen on dev** | **0.9794** | **0.9845** | **0.894** | +0.026 [+0.019, +0.034] |
 | reference: Opus edit, single model | 0.9746 | 0.9815 | 0.863 | — |
 
 \* at the specificity of the untempered ensemble at DS = 0.2.
+
+**Floored log-odds** (suggested in a reader comment). Instead of a difference of probabilities, take for the
+acceptor and donor class the log-odds L = log p − log(1 − p) of the stock model (T = 1), floor it at −c
+(i.e. treat p below ≈ e^−c as that value), and score max |L_alt − L_ref| over the 101 positions and both
+classes. The floor c is chosen on dev from {none, 12, 10, 8, 6, 5, 4, 3}; dev has a broad plateau at 4–6.
+For the ensemble the five softmax outputs are averaged first.
+
+| Seed (test) | floor (dev) | AUPRC | sensitivity at the stock specificity | vs T\* from dev, 95 % CI | no floor |
+|---|---|---|---|---|---|
+| rs10 | −5 | 0.9723 | 0.896 | +0.002 [−0.001, +0.005] | 0.9258 |
+| rs11 | −5 | 0.9756 | 0.879 | +0.005 [+0.001, +0.009] | 0.9313 |
+| rs12 | −5 | 0.9735 | 0.888 | +0.002 [−0.002, +0.006] | 0.9459 |
+| rs13 | −4 | 0.9750 | 0.881 | +0.002 [−0.002, +0.006] | 0.9407 |
+| rs14 | −6 | 0.9694 | 0.860 | +0.002 [−0.002, +0.005] | 0.9428 |
+
+On the ensemble, floored log-odds beat the common temperature by +0.004 [+0.001, +0.007] and the Opus edit by
++0.005 [+0.002, +0.008]. Without a floor, log-odds are worse than the stock score: for 99 % of benign variants
+the largest delta sits at a position where the site probability is ≤ 0.01, i.e. it is noise in log-odds of
+near-zero probabilities. The floor removes that noise and keeps the large changes at strong sites that the
+probability difference compresses. A temperature does a softer version of the same; the floor is one number
+with a direct meaning (a probability floor: 0.7 % at −5, 1.8 % at −4, 0.25 % at −6). Selection: one scalar per reading, eight floors vs
+a 0.5–20 grid of T, both on dev only.
 
 - **It is not one seed.** Every seed has its dev optimum at T ≈ 3–3.5 and gains +0.028…+0.033 on test.
 - **`calibrate` answers a different question.** `openspliceai calibrate` fits a per-class temperature vector by
@@ -172,8 +198,10 @@ specificity the untempered model of the same seed has at DS = 0.2. Intervals: pa
   AUPRC drops slightly. Honest site probabilities and good variant ranking need different temperatures. Note
   also that `openspliceai variant` does not apply a calibration temperature at all. The re-implementation uses
   our guard genes (GENCODE v46 basic), not OpenSpliceAI's own validation h5 files.
-- **There is an optimum.** Dropping the softmax altogether (T → ∞) is worse than the stock score.
-- **What it would take to use it.** A temperature changes the probability scale, so the ClinGen thresholds
+- **The gain is in how the output is read.** Temperature, floored log-odds and the Opus edit all de-saturate
+  strong sites; the two readings need no weight change and the floored log-odds is the strongest. Reading raw
+  logits or unfloored log-odds is worse than the stock score because of noise where there is no site.
+- **What it would take to use it.** Both readings change the score scale, so the ClinGen thresholds
   (≥ 0.2 for PP3, ≤ 0.1 for BP4) would have to be re-calibrated; it could only be an extra scoring mode. The
   evidence here is ClinVar labels only, part of which were informed by SpliceAI, and chr11/chr16 were in
   OpenSpliceAI's training data; an independent check on experimentally measured splicing (minigene, MAVE,
@@ -280,7 +308,7 @@ data/test/     test variants and 150 guard genes (hidden during the Opus run)
 submissions/   per participant: edit.py, model_edited.pt, REPORT.md, dev_log.jsonl
 controls/      temperature-only and gradient-trained weights
 results/       scores.jsonl (all test metrics), ds_<name>.npy (per-variant delta scores); dev/ — dev delta scores;
-               seeds_temperature.json — temperature on five seeds, ensemble and calibrate
+               seeds_temperature.json — temperature and floored log-odds on five seeds, ensemble, calibrate
 scripts/       model code, data build, scoring, bootstrap, gradient controls, extra analyses,
                preprint numbers (paper_analyses.py) and figures (make_figures.py)
 figures/       figures of the preprint
